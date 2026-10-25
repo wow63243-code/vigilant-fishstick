@@ -1,0 +1,1169 @@
+# Pillow Escape: builds an unsigned IPA from scratch on a macOS runner.
+#
+# This single file contains the whole app (SwiftUI sources, XcodeGen config and an icon generator).
+# Put it at .github/workflows/build-ipa.yml in an empty GitHub repo, then run it from the Actions tab.
+# The IPA is unsigned: sign/install it with Sideloadly, AltStore or TrollStore.
+
+name: Build Pillow Escape IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Generate project files
+        run: |
+          set -e
+          cat > project.yml <<'PILLOW_EOF_1'
+          name: PillowEscape
+          options:
+            bundleIdPrefix: com.pillowescape
+            deploymentTarget:
+              iOS: "16.0"
+            createIntermediateGroups: true
+          settings:
+            base:
+              SWIFT_VERSION: "5.0"
+              MARKETING_VERSION: "1.0"
+              CURRENT_PROJECT_VERSION: "1"
+          targets:
+            PillowEscape:
+              type: application
+              platform: iOS
+              sources:
+                - PillowEscape
+              info:
+                path: Config/Info.plist
+                properties:
+                  CFBundleDisplayName: Pillow Escape
+                  UILaunchScreen: {}
+                  UIUserInterfaceStyle: Dark
+                  UIApplicationSceneManifest:
+                    UIApplicationSupportsMultipleScenes: false
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                  UISupportedInterfaceOrientations~ipad:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationPortraitUpsideDown
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.pillowescape.app
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+                  CODE_SIGN_STYLE: Manual
+                  CODE_SIGNING_ALLOWED: "NO"
+                  CODE_SIGNING_REQUIRED: "NO"
+                  CODE_SIGN_IDENTITY: ""
+          PILLOW_EOF_1
+          mkdir -p tools
+          cat > tools/make_icon.py <<'PILLOW_EOF_2'
+          import math
+          import sys
+
+          from PIL import Image, ImageDraw, ImageFilter
+
+          out_path = sys.argv[1] if len(sys.argv) > 1 else "icon.png"
+          S = 1024
+
+          # Gradient background (deep teal -> purple)
+          bg = Image.new("RGB", (S, S))
+          px = bg.load()
+          c1, c2 = (14, 52, 54), (60, 40, 120)
+          for y in range(S):
+              for x in range(S):
+                  t = (x + y) / (2 * S)
+                  px[x, y] = tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+          # Soft glow blobs
+          glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          g = ImageDraw.Draw(glow)
+          g.ellipse((80, 60, 560, 540), fill=(110, 220, 170, 90))
+          g.ellipse((500, 520, 980, 1000), fill=(240, 140, 190, 80))
+          glow = glow.filter(ImageFilter.GaussianBlur(90))
+          bg = Image.alpha_composite(bg.convert("RGBA"), glow)
+
+          # Pillow shadow
+          box = (170, 250, 854, 774)
+          shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          ImageDraw.Draw(shadow).rounded_rectangle(
+              (box[0], box[1] + 28, box[2], box[3] + 28), radius=190, fill=(0, 0, 0, 140)
+          )
+          shadow = shadow.filter(ImageFilter.GaussianBlur(28))
+          bg = Image.alpha_composite(bg, shadow)
+
+          # Pillow body with diagonal gradient
+          body = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          bp = body.load()
+          a, b = (255, 247, 230), (236, 214, 242)
+          mask = Image.new("L", (S, S), 0)
+          ImageDraw.Draw(mask).rounded_rectangle(box, radius=190, fill=255)
+          for y in range(box[1], box[3]):
+              for x in range(box[0], box[2]):
+                  t = ((x - box[0]) + (y - box[1])) / ((box[2] - box[0]) + (box[3] - box[1]))
+                  bp[x, y] = tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3)) + (255,)
+          body.putalpha(mask)
+          bg = Image.alpha_composite(bg, body)
+
+          d = ImageDraw.Draw(bg)
+          d.rounded_rectangle(box, radius=190, outline=(255, 255, 255, 170), width=8)
+
+          # Dashed stitches along an inset rounded rectangle
+          inset = 56
+          l, t, r, bt = box[0] + inset, box[1] + inset, box[2] - inset, box[3] - inset
+          rad = 190 - inset
+          pts = []
+
+
+          def arc(cx, cy, a0, a1, n=24):
+              for i in range(n + 1):
+                  ang = math.radians(a0 + (a1 - a0) * i / n)
+                  pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+
+
+          pts.append((l + rad, t))
+          pts.append((r - rad, t))
+          arc(r - rad, t + rad, -90, 0)
+          pts.append((r, bt - rad))
+          arc(r - rad, bt - rad, 0, 90)
+          pts.append((l + rad, bt))
+          arc(l + rad, bt - rad, 90, 180)
+          pts.append((l, t + rad))
+          arc(l + rad, t + rad, 180, 270)
+          pts.append((l + rad, t))
+
+          seg = []
+          for i in range(len(pts) - 1):
+              x0, y0 = pts[i]
+              x1, y1 = pts[i + 1]
+              dist = math.hypot(x1 - x0, y1 - y0)
+              n = max(1, int(dist // 4))
+              for k in range(n):
+                  seg.append((x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n))
+
+          dash, gap = 22, 18
+          i = 0
+          while i < len(seg):
+              chunk = seg[i : i + dash // 4 + 1]
+              if len(chunk) > 1:
+                  d.line(chunk, fill=(60, 40, 90, 120), width=7)
+              i += (dash + gap) // 4
+
+          # Center button tuft
+          cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+          d.ellipse((cx - 30, cy - 30, cx + 30, cy + 30), fill=(60, 40, 90, 110))
+          for ang in range(0, 360, 45):
+              x2 = cx + 110 * math.cos(math.radians(ang))
+              y2 = cy + 110 * math.sin(math.radians(ang))
+              d.line((cx, cy, x2, y2), fill=(60, 40, 90, 55), width=5)
+
+          # App Store icons must not have an alpha channel
+          bg.convert("RGB").save(out_path)
+          print("icon written to", out_path)
+          PILLOW_EOF_2
+          mkdir -p PillowEscape/Assets.xcassets
+          cat > PillowEscape/Assets.xcassets/Contents.json <<'PILLOW_EOF_3'
+          {
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          PILLOW_EOF_3
+          mkdir -p PillowEscape/Assets.xcassets/AppIcon.appiconset
+          cat > PillowEscape/Assets.xcassets/AppIcon.appiconset/Contents.json <<'PILLOW_EOF_4'
+          {
+            "images" : [
+              {
+                "filename" : "icon.png",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          PILLOW_EOF_4
+          mkdir -p PillowEscape
+          cat > PillowEscape/Config.swift <<'PILLOW_EOF_5'
+          import SwiftUI
+
+          /// Everything you might want to tweak lives here.
+          enum Config {
+              static let appName = "Pillow Escape"
+              static let supportString = "iOS 16.0 – 27.0 (arm64e)"
+              static let credit = "Made with pillows"
+              static let hostName = "pillow"
+          }
+
+          enum Theme {
+              /// Dopamine's default action menu color (#3F3F3F at ~45% alpha).
+              static let panel = Color(.sRGB, red: 63.0 / 255.0, green: 63.0 / 255.0, blue: 63.0 / 255.0, opacity: 114.0 / 255.0)
+              static let textSecondary = Color.white.opacity(0.6)
+              static let textTertiary = Color.white.opacity(0.5)
+          }
+
+          struct PackageManager: Identifiable, Hashable {
+              let id: String
+              let name: String
+
+              /// No Sileo here, on purpose.
+              static let all: [PackageManager] = [
+                  PackageManager(id: "zebra", name: "Zebra"),
+                  PackageManager(id: "pillow", name: "Pillow Package")
+              ]
+          }
+          PILLOW_EOF_5
+          mkdir -p PillowEscape
+          cat > PillowEscape/PillowEscapeApp.swift <<'PILLOW_EOF_6'
+          import SwiftUI
+
+          @main
+          struct PillowEscapeApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      RootView()
+                          .preferredColorScheme(.dark)
+                          .statusBarHidden(false)
+                  }
+              }
+          }
+          PILLOW_EOF_6
+          mkdir -p PillowEscape
+          cat > PillowEscape/Icons.swift <<'PILLOW_EOF_7'
+          import SwiftUI
+
+          /// Soft, blurred gradient background (stand-in for Dopamine's blurred photo themes).
+          struct BackgroundView: View {
+              var body: some View {
+                  ZStack {
+                      LinearGradient(
+                          colors: [
+                              Color(red: 0.04, green: 0.13, blue: 0.15),
+                              Color(red: 0.08, green: 0.27, blue: 0.24),
+                              Color(red: 0.13, green: 0.17, blue: 0.34)
+                          ],
+                          startPoint: .topLeading,
+                          endPoint: .bottomTrailing
+                      )
+                      Circle()
+                          .fill(Color(red: 0.40, green: 0.85, blue: 0.65).opacity(0.35))
+                          .frame(width: 320, height: 320)
+                          .blur(radius: 60)
+                          .offset(x: -110, y: -240)
+                      Circle()
+                          .fill(Color(red: 0.55, green: 0.45, blue: 0.95).opacity(0.30))
+                          .frame(width: 360, height: 360)
+                          .blur(radius: 70)
+                          .offset(x: 140, y: 120)
+                      Circle()
+                          .fill(Color(red: 0.95, green: 0.55, blue: 0.75).opacity(0.22))
+                          .frame(width: 260, height: 260)
+                          .blur(radius: 60)
+                          .offset(x: -120, y: 300)
+                  }
+                  .ignoresSafeArea()
+              }
+          }
+
+          /// A little stitched pillow. Used as the logo and inside icons.
+          struct PillowIcon: View {
+              var size: CGFloat = 40
+
+              var body: some View {
+                  ZStack {
+                      RoundedRectangle(cornerRadius: size * 0.34, style: .continuous)
+                          .fill(
+                              LinearGradient(
+                                  colors: [
+                                      Color(red: 1.0, green: 0.97, blue: 0.90),
+                                      Color(red: 0.93, green: 0.84, blue: 0.95)
+                                  ],
+                                  startPoint: .topLeading,
+                                  endPoint: .bottomTrailing
+                              )
+                          )
+                      RoundedRectangle(cornerRadius: size * 0.34, style: .continuous)
+                          .strokeBorder(Color.white.opacity(0.6), lineWidth: size * 0.03)
+                      RoundedRectangle(cornerRadius: size * 0.26, style: .continuous)
+                          .inset(by: size * 0.12)
+                          .stroke(
+                              Color.black.opacity(0.2),
+                              style: StrokeStyle(lineWidth: max(1, size * 0.025), dash: [size * 0.06, size * 0.05])
+                          )
+                      Circle()
+                          .fill(Color.black.opacity(0.2))
+                          .frame(width: size * 0.1, height: size * 0.1)
+                  }
+                  .frame(width: size, height: size * 0.82)
+                  .shadow(color: Color.black.opacity(0.25), radius: size * 0.1, x: 0, y: size * 0.05)
+              }
+          }
+
+          /// Generic striped tile used for the "Zebra" option (not Zebra's real logo).
+          struct ZebraIcon: View {
+              var body: some View {
+                  ZStack {
+                      LinearGradient(
+                          colors: [Color(white: 0.96), Color(white: 0.80)],
+                          startPoint: .top,
+                          endPoint: .bottom
+                      )
+                      HStack(spacing: 7) {
+                          ForEach(0..<7, id: \.self) { _ in
+                              Capsule()
+                                  .fill(Color.black.opacity(0.85))
+                                  .frame(width: 6)
+                          }
+                      }
+                      .frame(width: 120, height: 120)
+                      .rotationEffect(.degrees(28))
+                  }
+                  .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+              }
+          }
+
+          struct PillowPackageIcon: View {
+              var body: some View {
+                  ZStack {
+                      LinearGradient(
+                          colors: [
+                              Color(red: 0.55, green: 0.45, blue: 0.95),
+                              Color(red: 0.95, green: 0.55, blue: 0.75)
+                          ],
+                          startPoint: .topLeading,
+                          endPoint: .bottomTrailing
+                      )
+                      PillowIcon(size: 46)
+                  }
+                  .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+              }
+          }
+
+          /// Small animated double-helix like the one next to "Jailbreaking".
+          struct HelixIndicator: View {
+              var body: some View {
+                  TimelineView(.animation) { context in
+                      let t = context.date.timeIntervalSinceReferenceDate
+                      Canvas { gc, size in
+                          let count = 6
+                          let radius: CGFloat = 1.7
+                          for i in 0..<count {
+                              let x = size.width * CGFloat(i) / CGFloat(count - 1)
+                              let phase = t * 3.0 + Double(i) * 0.9
+                              let offset = CGFloat(sin(phase)) * size.height * 0.35
+                              let y1 = size.height / 2 + offset
+                              let y2 = size.height / 2 - offset
+                              let r1 = CGRect(x: x - radius, y: y1 - radius, width: radius * 2, height: radius * 2)
+                              let r2 = CGRect(x: x - radius, y: y2 - radius, width: radius * 2, height: radius * 2)
+                              gc.fill(Path(ellipseIn: r1), with: .color(Color.white.opacity(0.95)))
+                              gc.fill(Path(ellipseIn: r2), with: .color(Color.white.opacity(0.45)))
+                          }
+                      }
+                  }
+                  .frame(width: 30, height: 12)
+              }
+          }
+          PILLOW_EOF_7
+          mkdir -p PillowEscape
+          cat > PillowEscape/HomeParts.swift <<'PILLOW_EOF_8'
+          import SwiftUI
+
+          struct PanelBackground: View {
+              var body: some View {
+                  ZStack {
+                      RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
+                      RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.panel)
+                  }
+              }
+          }
+
+          struct HeaderView: View {
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 2) {
+                      HStack(spacing: 10) {
+                          PillowIcon(size: 40)
+                          Text(Config.appName)
+                              .font(.system(size: 30, weight: .bold, design: .rounded))
+                              .foregroundColor(.white)
+                      }
+                      .padding(.bottom, 4)
+                      Text(Config.supportString)
+                          .font(.system(size: 14, weight: .medium))
+                          .foregroundColor(.white)
+                      Text(Config.credit)
+                          .font(.system(size: 14, weight: .regular))
+                          .foregroundColor(Theme.textSecondary)
+                  }
+                  .padding(.leading, 5)
+                  .shadow(color: Color.black.opacity(0.3), radius: 30)
+              }
+          }
+
+          struct MenuItem: Identifiable {
+              let id: String
+              let title: String
+              let icon: String
+              let action: () -> Void
+          }
+
+          struct ActionMenu: View {
+              let items: [MenuItem]
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                          Button(action: item.action) {
+                              HStack(spacing: 10) {
+                                  Image(systemName: item.icon)
+                                      .font(.system(size: 14, weight: .medium))
+                                      .frame(width: 22)
+                                  Text(item.title)
+                                      .font(.system(size: 16, weight: .regular))
+                                  Spacer()
+                                  Image(systemName: "chevron.right")
+                                      .font(.system(size: 12, weight: .semibold))
+                                      .opacity(0.5)
+                              }
+                              .foregroundColor(Color.white.opacity(0.85))
+                              .padding(.horizontal, 16)
+                              .frame(height: 48)
+                              .contentShape(Rectangle())
+                          }
+                          if index < items.count - 1 {
+                              Divider()
+                                  .background(Color.white.opacity(0.12))
+                                  .padding(.leading, 16)
+                          }
+                      }
+                  }
+                  .background(PanelBackground())
+                  .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+              }
+          }
+
+          struct AppSwitch: View {
+              let manager: PackageManager
+              let isOn: Bool
+              let action: () -> Void
+
+              var body: some View {
+                  Button(action: action) {
+                      VStack(spacing: 10) {
+                          ZStack(alignment: .topTrailing) {
+                              icon.frame(width: 64, height: 64)
+                              if isOn {
+                                  Image(systemName: "checkmark.circle.fill")
+                                      .font(.system(size: 20))
+                                      .foregroundColor(.white)
+                                      .background(Circle().fill(Color.black.opacity(0.35)))
+                                      .offset(x: 6, y: -6)
+                              }
+                          }
+                          Text(manager.name)
+                              .font(.system(size: 13, weight: .medium))
+                              .foregroundColor(.white)
+                      }
+                      .frame(width: 110, height: 110)
+                      .opacity(isOn ? 1 : 0.45)
+                      .scaleEffect(isOn ? 1 : 0.94)
+                      .animation(.easeOut(duration: 0.2), value: isOn)
+                  }
+                  .buttonStyle(.plain)
+              }
+
+              @ViewBuilder
+              private var icon: some View {
+                  if manager.id == "zebra" {
+                      ZebraIcon()
+                  } else {
+                      PillowPackageIcon()
+                  }
+              }
+          }
+
+          struct PackagePickerView: View {
+              @Binding var selected: Set<String>
+              let onContinue: () -> Void
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      Spacer()
+                      Text("Select Package Managers")
+                          .font(.system(size: 24, weight: .medium))
+                          .foregroundColor(.white)
+                      HStack(spacing: 0) {
+                          ForEach(PackageManager.all) { manager in
+                              AppSwitch(manager: manager, isOn: selected.contains(manager.id)) {
+                                  if selected.contains(manager.id) {
+                                      selected.remove(manager.id)
+                                  } else {
+                                      selected.insert(manager.id)
+                                  }
+                              }
+                          }
+                      }
+                      .padding(.top, 30)
+                      Text("The selected package managers will be installed during the jailbreak.")
+                          .font(.system(size: 14))
+                          .foregroundColor(Theme.textTertiary)
+                          .multilineTextAlignment(.center)
+                          .frame(width: 275)
+                          .padding(.top, 15)
+                      Spacer()
+                      Button(action: onContinue) {
+                          HStack(spacing: 10) {
+                              Image(systemName: "arrow.right")
+                                  .font(.system(size: 14, weight: .medium))
+                              Text("Continue")
+                                  .font(.system(size: 16, weight: .medium))
+                          }
+                          .foregroundColor(Color.white.opacity(0.75))
+                          .frame(maxWidth: .infinity)
+                          .frame(height: 50)
+                          .background(
+                              RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                  .fill(Color.white.opacity(selected.isEmpty ? 0.1 : 0.2))
+                          )
+                      }
+                      .disabled(selected.isEmpty)
+                      .padding(.horizontal, 30)
+                      .padding(.bottom, 40)
+                  }
+                  .frame(maxWidth: .infinity, maxHeight: .infinity)
+              }
+          }
+
+          enum LineState {
+              case active, done, success
+          }
+
+          struct LogLine: Identifiable {
+              let id = UUID()
+              var text: String
+              var state: LineState = .active
+          }
+
+          /// Lyrics-style log: newest line at the bottom, older lines fade upward.
+          struct LogView: View {
+              let lines: [LogLine]
+
+              private let opacities: [Double] = [1.0, 0.55, 0.3, 0.12, 0.0, 0.0]
+
+              var body: some View {
+                  let visible = Array(lines.suffix(6))
+                  VStack(alignment: .leading, spacing: 0) {
+                      Spacer(minLength: 0)
+                      ForEach(Array(visible.enumerated()), id: \.element.id) { index, line in
+                          let distance = visible.count - 1 - index
+                          HStack(spacing: 12) {
+                              iconView(for: line.state)
+                              Text(line.text)
+                                  .font(.system(size: 17, weight: .regular))
+                                  .foregroundColor(.white)
+                                  .lineLimit(1)
+                              Spacer(minLength: 0)
+                          }
+                          .frame(height: 40)
+                          .opacity(opacities[min(distance, opacities.count - 1)])
+                          .transition(.move(edge: .bottom).combined(with: .opacity))
+                      }
+                  }
+                  .padding(.horizontal, 25)
+                  .padding(.bottom, 40)
+                  .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                  .animation(.easeOut(duration: 0.3), value: lines.count)
+              }
+
+              @ViewBuilder
+              private func iconView(for state: LineState) -> some View {
+                  switch state {
+                  case .active:
+                      Color.clear.frame(width: 22, height: 22)
+                  case .done:
+                      Image(systemName: "checkmark")
+                          .font(.system(size: 17))
+                          .foregroundColor(.white)
+                          .frame(width: 22, height: 22)
+                  case .success:
+                      Image(systemName: "lock.open")
+                          .font(.system(size: 17))
+                          .foregroundColor(.white)
+                          .frame(width: 22, height: 22)
+                  }
+              }
+          }
+          PILLOW_EOF_8
+          mkdir -p PillowEscape
+          cat > PillowEscape/RootView.swift <<'PILLOW_EOF_9'
+          import SwiftUI
+
+          enum Phase {
+              case home, picker, jailbreaking, terminal
+          }
+
+          struct RootView: View {
+              @State private var phase: Phase = .home
+              @State private var expanded = false
+              @State private var showTitle = false
+              @State private var selected: Set<String> = ["pillow"]
+              @State private var lines: [LogLine] = []
+              @State private var blackout = false
+              @State private var showSettings = false
+              @State private var showCredits = false
+              @State private var infoMessage = ""
+              @State private var showInfo = false
+
+              var body: some View {
+                  ZStack {
+                      BackgroundView()
+                      if phase == .terminal {
+                          TerminalView(onReboot: reboot)
+                              .transition(.opacity)
+                      } else {
+                          GeometryReader { geo in
+                              layout(geo)
+                          }
+                          .ignoresSafeArea()
+                      }
+                      Color.black
+                          .opacity(blackout ? 1 : 0)
+                          .ignoresSafeArea()
+                          .allowsHitTesting(false)
+                  }
+                  .sheet(isPresented: $showSettings) { SettingsView() }
+                  .sheet(isPresented: $showCredits) { CreditsView() }
+                  .alert(infoMessage, isPresented: $showInfo) {
+                      Button("OK", role: .cancel) {}
+                  }
+              }
+
+              // MARK: Layout
+
+              @ViewBuilder
+              private func layout(_ geo: GeometryProxy) -> some View {
+                  let w = geo.size.width
+                  let h = geo.size.height
+                  let statusBar = max(15, geo.safeAreaInsets.top - 20)
+                  let stackH = h * 0.73
+                  let centerY = h / 2 + statusBar
+                  let buttonCenterY = centerY + stackH / 2 - 30
+                  let topPadding = h * 0.26 + 35
+                  let expandedHeight = h - topPadding + 100
+                  let contentW = min(w - 40, 520)
+
+                  ZStack {
+                      VStack(alignment: .leading, spacing: 0) {
+                          HeaderView()
+                              .offset(y: expanded ? -25 : 0)
+                          Spacer(minLength: 0)
+                          ActionMenu(items: menuItems)
+                              .opacity(expanded ? 0 : 1)
+                              .allowsHitTesting(!expanded)
+                          Spacer(minLength: 0)
+                          Color.clear.frame(height: 60)
+                      }
+                      .frame(width: contentW, height: stackH)
+                      .position(x: w / 2, y: centerY)
+
+                      panel(width: expanded ? w : contentW, height: expanded ? expandedHeight : 60)
+                          .position(x: w / 2, y: expanded ? topPadding + expandedHeight / 2 : buttonCenterY)
+                  }
+                  .frame(width: w, height: h)
+              }
+
+              private var menuItems: [MenuItem] {
+                  [
+                      MenuItem(id: "settings", title: "Settings", icon: "gearshape") { showSettings = true },
+                      MenuItem(id: "respring", title: "Restart SpringBoard", icon: "arrow.clockwise") {
+                          info("SpringBoard restarted.\n(Just kidding. Nothing happened.)")
+                      },
+                      MenuItem(id: "userspace", title: "Reboot Userspace", icon: "arrow.clockwise.circle") {
+                          info("Userspace rebooted.\n(Also a joke. The pillows stay put.)")
+                      },
+                      MenuItem(id: "credits", title: "Credits", icon: "info.circle") { showCredits = true }
+                  ]
+              }
+
+              private func panel(width: CGFloat, height: CGFloat) -> some View {
+                  ZStack(alignment: .top) {
+                      PanelBackground()
+                      Button(action: startExpand) {
+                          HStack(spacing: 10) {
+                              Image(systemName: "lock.open")
+                                  .font(.system(size: 14, weight: .medium))
+                              Text("Jailbreak")
+                                  .font(.system(size: 16, weight: .medium))
+                          }
+                          .foregroundColor(Color.white.opacity(0.75))
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                          .contentShape(Rectangle())
+                      }
+                      .opacity(expanded ? 0 : 1)
+                      .disabled(expanded)
+
+                      if expanded {
+                          expandedContent
+                      }
+                  }
+                  .frame(width: width, height: height)
+              }
+
+              private var expandedContent: some View {
+                  ZStack(alignment: .top) {
+                      if showTitle {
+                          HStack(spacing: 10) {
+                              HelixIndicator()
+                              Text("Jailbreaking")
+                                  .font(.system(size: 18, weight: .regular))
+                                  .foregroundColor(.white)
+                          }
+                          .padding(.top, 20)
+                          .transition(.opacity)
+                      }
+                      if phase == .picker {
+                          PackagePickerView(selected: $selected, onContinue: startJailbreak)
+                              .transition(.opacity)
+                      } else if phase == .jailbreaking {
+                          LogView(lines: lines)
+                      }
+                  }
+                  .frame(maxWidth: .infinity, maxHeight: .infinity)
+                  // The panel runs 100pt past the bottom of the screen (hides the corners), so pad it back.
+                  .padding(.bottom, 100)
+              }
+
+              // MARK: Actions
+
+              private func info(_ message: String) {
+                  infoMessage = message
+                  showInfo = true
+              }
+
+              private func startExpand() {
+                  withAnimation(.spring(response: 0.75, dampingFraction: 0.9)) {
+                      expanded = true
+                  }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                      withAnimation(.easeOut(duration: 0.2)) { showTitle = true }
+                  }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                      withAnimation(.easeOut(duration: 0.25)) { phase = .picker }
+                  }
+              }
+
+              private func startJailbreak() {
+                  Task { @MainActor in
+                      withAnimation(.easeOut(duration: 0.25)) { phase = .jailbreaking }
+                      await runLog()
+                  }
+              }
+
+              private func pause(_ seconds: Double) async {
+                  try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+              }
+
+              @MainActor
+              private func runLog() async {
+                  lines = []
+
+                  func push(_ text: String) {
+                      withAnimation(.easeOut(duration: 0.3)) {
+                          for i in lines.indices { lines[i].state = .done }
+                          lines.append(LogLine(text: text))
+                      }
+                  }
+                  func update(_ text: String) {
+                      guard !lines.isEmpty else { return }
+                      lines[lines.count - 1].text = text
+                  }
+
+                  let chosen = PackageManager.all.filter { selected.contains($0.id) }.map { $0.name }
+
+                  push("Checking pillow compatibility")
+                  await pause(1.0)
+                  push("Escaping the sim-sim box using eternal export")
+                  await pause(1.7)
+                  push("Gathering fluff from the kernel")
+                  await pause(1.2)
+                  push("Stuffing pillows into the system")
+                  for pct in stride(from: 0, through: 96, by: 8) {
+                      update("Stuffing pillows into the system… \(pct)%")
+                      await pause(0.12)
+                  }
+                  update("Stuffing pillows into the system… 100%")
+                  await pause(0.5)
+                  for name in chosen {
+                      push("Installing \(name)")
+                      await pause(1.2)
+                  }
+                  push("Making the system pillowfull")
+                  await pause(1.4)
+                  push("Rebooting userspace")
+                  await pause(1.2)
+                  push("Done")
+                  withAnimation(.easeOut(duration: 0.3)) {
+                      for i in lines.indices { lines[i].state = .success }
+                  }
+                  await pause(1.3)
+
+                  withAnimation(.easeIn(duration: 0.6)) { blackout = true }
+                  await pause(0.8)
+                  phase = .terminal
+                  await pause(0.1)
+                  withAnimation(.easeOut(duration: 0.6)) { blackout = false }
+              }
+
+              private func reboot() {
+                  withAnimation(.easeIn(duration: 0.4)) { blackout = true }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                      phase = .home
+                      expanded = false
+                      showTitle = false
+                      lines = []
+                      withAnimation(.easeOut(duration: 0.5)) { blackout = false }
+                  }
+              }
+          }
+          PILLOW_EOF_9
+          mkdir -p PillowEscape
+          cat > PillowEscape/TerminalView.swift <<'PILLOW_EOF_10'
+          import SwiftUI
+
+          struct TerminalLine: Identifiable {
+              let id = UUID()
+              let text: String
+              let isInput: Bool
+          }
+
+          struct TerminalView: View {
+              var onReboot: () -> Void
+
+              @State private var lines: [TerminalLine] = TerminalView.banner
+              @State private var input = ""
+              @State private var cwd = "~"
+              @FocusState private var focused: Bool
+
+              private var prompt: String { "root@\(Config.hostName):\(cwd)# " }
+
+              private static let banner: [TerminalLine] = [
+                  "Pillow Escape (fake) — it does nothing, and that's the point.",
+                  "Welcome to PillowOS 27.0 (arm64)",
+                  "Type 'help' for a list of commands.",
+                  ""
+              ].map { TerminalLine(text: $0, isInput: false) }
+
+              private let green = Color(red: 0.62, green: 1.0, blue: 0.72)
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      titleBar
+                      ScrollViewReader { proxy in
+                          ScrollView {
+                              VStack(alignment: .leading, spacing: 2) {
+                                  ForEach(lines) { line in
+                                      Text(line.text.isEmpty ? " " : line.text)
+                                          .font(.system(size: 13, design: .monospaced))
+                                          .foregroundColor(line.isInput ? Color.white : green)
+                                          .frame(maxWidth: .infinity, alignment: .leading)
+                                  }
+                                  Color.clear.frame(height: 1).id("bottom")
+                              }
+                              .padding(.horizontal, 14)
+                              .padding(.vertical, 10)
+                          }
+                          .onChange(of: lines.count) { _ in
+                              withAnimation(.easeOut(duration: 0.15)) {
+                                  proxy.scrollTo("bottom", anchor: .bottom)
+                              }
+                          }
+                      }
+                      inputBar
+                  }
+                  .background(Color.black.opacity(0.88).ignoresSafeArea())
+                  .onAppear { focused = true }
+              }
+
+              private var titleBar: some View {
+                  HStack {
+                      Text("pillow — zsh")
+                          .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                          .foregroundColor(Theme.textSecondary)
+                  }
+                  .frame(maxWidth: .infinity)
+                  .padding(.vertical, 10)
+                  .background(Color.white.opacity(0.06))
+              }
+
+              private var inputBar: some View {
+                  HStack(spacing: 0) {
+                      Text(prompt)
+                          .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                          .foregroundColor(green)
+                      TextField("", text: $input)
+                          .font(.system(size: 13, design: .monospaced))
+                          .foregroundColor(.white)
+                          .textInputAutocapitalization(.never)
+                          .disableAutocorrection(true)
+                          .submitLabel(.send)
+                          .focused($focused)
+                          .onSubmit { run(input) }
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.vertical, 12)
+                  .background(Color.white.opacity(0.06))
+              }
+
+              // MARK: Commands
+
+              private func emit(_ output: [String]) {
+                  lines.append(contentsOf: output.map { TerminalLine(text: $0, isInput: false) })
+              }
+
+              private func run(_ raw: String) {
+                  let typed = raw.trimmingCharacters(in: .whitespaces)
+                  lines.append(TerminalLine(text: prompt + raw, isInput: true))
+                  input = ""
+                  focused = true
+                  guard !typed.isEmpty else { return }
+
+                  var parts = typed.split(separator: " ").map(String.init)
+                  if parts.first == "sudo" && parts.count > 1 { parts.removeFirst() }
+                  let cmd = parts[0]
+                  let args = Array(parts.dropFirst())
+
+                  switch cmd {
+                  case "help":
+                      emit([
+                          "Available commands:",
+                          "  help          show this list",
+                          "  ls            list files",
+                          "  pwd / cd      where am I",
+                          "  whoami / id   who are you",
+                          "  uname [-a]    system info",
+                          "  date          the date",
+                          "  pillowfetch   system info, but fluffy",
+                          "  pillow        Pillow Package (try: pillow install memory-foam)",
+                          "  zebra         open Zebra",
+                          "  echo <text>   repeat text",
+                          "  clear         clear the screen",
+                          "  reboot        reboot userspace"
+                      ])
+                  case "ls":
+                      emit(["Applications  bin  fluff  pillows  usr  var  .pillowrc"])
+                  case "pwd":
+                      emit([cwd == "~" ? "/var/mobile" : cwd])
+                  case "cd":
+                      if let target = args.first {
+                          if target == ".." { cwd = "/" }
+                          else if target.hasPrefix("/") || target.hasPrefix("~") { cwd = target }
+                          else { cwd = (cwd == "~" ? "~" : cwd) + "/" + target }
+                      } else {
+                          cwd = "~"
+                      }
+                  case "whoami":
+                      emit(["pillow"])
+                  case "id":
+                      emit(["uid=0(pillow) gid=0(pillow) groups=0(pillow),1(cushion),2(duvet)"])
+                  case "uname":
+                      if args.contains("-a") {
+                          emit(["Darwin \(Config.hostName) 27.0.0 PillowOS Kernel Version 27.0.0 RELEASE_ARM64 arm64"])
+                      } else {
+                          emit(["Darwin"])
+                      }
+                  case "date":
+                      emit([Date().formatted(date: .complete, time: .standard)])
+                  case "echo":
+                      emit([args.joined(separator: " ")])
+                  case "clear":
+                      lines = []
+                  case "pillowfetch", "neofetch":
+                      emit([
+                          "   .-\"\"\"\"\"\"\"-.      root@\(Config.hostName)",
+                          "  /  ~  ~  ~  \\     -------------",
+                          " |  ~  fluff ~ |    OS: PillowOS 27.0 arm64",
+                          "  \\  ~  ~  ~  /     Kernel: Fluffy 27.0.0",
+                          "   '-.......-'      Packages: 12 (pillow)",
+                          "                    Shell: zsh (fake)",
+                          "                    Fluff level: 100%"
+                      ])
+                  case "pillow":
+                      runPillow(args)
+                  case "zebra":
+                      emit(["Opening Zebra… 🦓", "(it's a joke app, there's nothing to open)"])
+                  case "sileo":
+                      emit(["zsh: command not found: sileo", "(no Sileo here. try 'zebra' or 'pillow')"])
+                  case "apt", "apt-get", "dpkg":
+                      emit(["E: Could not get lock /var/lib/dpkg/lock. A pillow is sleeping on it.", "Try 'pillow install <name>' instead."])
+                  case "rm":
+                      emit(["rm: permission denied (the pillows are load-bearing)"])
+                  case "reboot", "exit", "ldrestart":
+                      emit(["Rebooting userspace…"])
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { onReboot() }
+                  default:
+                      emit(["zsh: command not found: \(cmd)"])
+                  }
+              }
+
+              private func runPillow(_ args: [String]) {
+                  guard let sub = args.first else {
+                      emit(["Pillow Package 1.0", "usage: pillow <install|list> [name]"])
+                      return
+                  }
+                  switch sub {
+                  case "list":
+                      emit(["memory-foam       1.0", "down-feather      2.1", "body-pillow-ng    0.9", "throw-cushion     3.4"])
+                  case "install":
+                      let name = args.dropFirst().first ?? "memory-foam"
+                      emit([
+                          "Reading package lists… Done",
+                          "Fluffing \(name)…",
+                          "Installed \(name) (nothing actually changed)"
+                      ])
+                  default:
+                      emit(["pillow: unknown command '\(sub)'"])
+                  }
+              }
+          }
+          PILLOW_EOF_10
+          mkdir -p PillowEscape
+          cat > PillowEscape/InfoSheets.swift <<'PILLOW_EOF_11'
+          import SwiftUI
+
+          struct SettingsView: View {
+              @Environment(\.dismiss) private var dismiss
+              @State private var tweaks = true
+              @State private var hideApp = false
+              @State private var fluff = 100.0
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section(header: Text("Jailbreak")) {
+                              Toggle("Tweak Injection", isOn: $tweaks)
+                              Toggle("Hide Pillow Escape app", isOn: $hideApp)
+                          }
+                          Section(
+                              header: Text("Pillows"),
+                              footer: Text("None of these settings do anything. This is a joke app.")
+                          ) {
+                              VStack(alignment: .leading, spacing: 8) {
+                                  Text("Fluff level: \(Int(fluff))%")
+                                  Slider(value: $fluff, in: 0...100)
+                              }
+                          }
+                      }
+                      .navigationTitle("Settings")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
+                      }
+                  }
+                  .preferredColorScheme(.dark)
+              }
+          }
+
+          struct CreditsView: View {
+              @Environment(\.dismiss) private var dismiss
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section(header: Text("About")) {
+                              Text("Pillow Escape is a joke app. It does not jailbreak anything, and it never touches your system.")
+                          }
+                          Section(header: Text("Design")) {
+                              VStack(alignment: .leading, spacing: 4) {
+                                  Text("UI inspired by Dopamine")
+                                  Text("by opa334 and tomt000 (MIT License)")
+                                      .font(.footnote)
+                                      .foregroundColor(.secondary)
+                              }
+                              Text("Not affiliated with Dopamine, Zebra, or their authors.")
+                                  .font(.footnote)
+                                  .foregroundColor(.secondary)
+                          }
+                      }
+                      .navigationTitle("Credits")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
+                      }
+                  }
+                  .preferredColorScheme(.dark)
+              }
+          }
+          PILLOW_EOF_11
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate app icon
+        run: |
+          pip install pillow
+          python tools/make_icon.py PillowEscape/Assets.xcassets/AppIcon.appiconset/icon.png
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PillowEscape.xcodeproj \
+            -scheme PillowEscape \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/PillowEscape.app Payload/
+          zip -qr PillowEscape.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PillowEscape-ipa
+          path: PillowEscape.ipa
+
+      - name: Upload build log (only if the build failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Publish release with the IPA
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Pillow Escape build ${{ github.run_number }}
+          files: PillowEscape.ipa
