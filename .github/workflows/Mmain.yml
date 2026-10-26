@@ -1,0 +1,549 @@
+name: Build IPA
+
+# Put this single file at .github/workflows/build.yml in an otherwise empty repo.
+# On every push it generates the whole Xcode project, builds it on macOS,
+# and uploads an unsigned .ipa as a workflow artifact.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  APP_NAME: LoveYou
+  DISPLAY_NAME: Love You
+  BUNDLE_ID: com.example.loveyou
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate source files
+        shell: bash
+        run: |
+          mkdir -p Sources
+
+          cat > Sources/App.swift <<'EOF'
+          import SwiftUI
+
+          @main
+          struct LoveYouApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+          EOF
+
+          cat > Sources/Pickers.swift <<'EOF'
+          import SwiftUI
+          import PhotosUI
+
+          struct PhotoPicker: UIViewControllerRepresentable {
+              var onPick: (UIImage) -> Void
+              @Environment(\.presentationMode) private var presentationMode
+
+              func makeUIViewController(context: Context) -> PHPickerViewController {
+                  var config = PHPickerConfiguration()
+                  config.filter = .images
+                  config.selectionLimit = 1
+                  let picker = PHPickerViewController(configuration: config)
+                  picker.delegate = context.coordinator
+                  return picker
+              }
+
+              func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+              func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+              final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+                  let parent: PhotoPicker
+                  init(_ parent: PhotoPicker) { self.parent = parent }
+
+                  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+                      parent.presentationMode.wrappedValue.dismiss()
+                      guard let provider = results.first?.itemProvider,
+                            provider.canLoadObject(ofClass: UIImage.self) else { return }
+                      provider.loadObject(ofClass: UIImage.self) { object, _ in
+                          if let image = object as? UIImage {
+                              DispatchQueue.main.async { self.parent.onPick(image) }
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct ShareSheet: UIViewControllerRepresentable {
+              let items: [Any]
+
+              func makeUIViewController(context: Context) -> UIActivityViewController {
+                  UIActivityViewController(activityItems: items, applicationActivities: nil)
+              }
+
+              func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+          }
+          EOF
+
+          cat > Sources/HordeClient.swift <<'EOF'
+          import UIKit
+
+          // Talks to the AI Horde (aihorde.net), a free crowdsourced image-generation
+          // network. The anonymous key "0000000000" is public, so there is no secret
+          // anywhere in this app or repo.
+
+          enum HordeError: LocalizedError {
+              case badImage
+              case server(String)
+              case timedOut
+              case noResult
+              case censored
+
+              var errorDescription: String? {
+                  switch self {
+                  case .badImage: return "Couldn't read that image."
+                  case .server(let message): return message
+                  case .timedOut: return "The free queue is too busy right now. Try again in a minute."
+                  case .noResult: return "The AI finished but sent nothing back."
+                  case .censored: return "The AI filtered that result. Try a different image or wording."
+                  }
+              }
+          }
+
+          struct HordeClient {
+              let apiKey: String
+              private let base = "https://aihorde.net/api/v2"
+
+              static func lovelyPrompt(from text: String) -> String {
+                  let core = text.isEmpty ? "make it wonderful" : text
+                  return "\(core), beautiful, lovely, warm soft light, vibrant colors, highly detailed, masterpiece"
+              }
+
+              func generate(
+                  image: UIImage,
+                  prompt: String,
+                  strength: Double,
+                  progress: @escaping (String) -> Void
+              ) async throws -> UIImage {
+                  let prepared = Self.prepare(image)
+                  guard let jpeg = prepared.image.jpegData(compressionQuality: 0.9) else {
+                      throw HordeError.badImage
+                  }
+
+                  let payload: [String: Any] = [
+                      "prompt": prompt + " ### blurry, distorted, ugly, text, watermark, low quality",
+                      "params": [
+                          "sampler_name": "k_euler_a",
+                          "cfg_scale": 7.5,
+                          "denoising_strength": strength,
+                          "width": prepared.width,
+                          "height": prepared.height,
+                          "steps": 25,
+                          "n": 1
+                      ] as [String: Any],
+                      "nsfw": false,
+                      "censor_nsfw": true,
+                      "source_image": jpeg.base64EncodedString(),
+                      "source_processing": "img2img",
+                      "r2": true,
+                      "shared": false
+                  ]
+
+                  let body = try JSONSerialization.data(withJSONObject: payload)
+                  let (submitData, submitResponse) = try await URLSession.shared.data(
+                      for: makeRequest("/generate/async", method: "POST", body: body)
+                  )
+                  try Self.validate(submitData, submitResponse)
+
+                  guard let submitObject = try? JSONSerialization.jsonObject(with: submitData) as? [String: Any],
+                        let jobID = submitObject["id"] as? String else {
+                      throw HordeError.noResult
+                  }
+
+                  var finished = false
+                  let deadline = Date().addingTimeInterval(600)
+
+                  while Date() < deadline {
+                      try await Task.sleep(nanoseconds: 3_000_000_000)
+                      let (checkData, checkResponse) = try await URLSession.shared.data(
+                          for: makeRequest("/generate/check/\(jobID)")
+                      )
+                      try Self.validate(checkData, checkResponse)
+                      let check = (try? JSONSerialization.jsonObject(with: checkData) as? [String: Any]) ?? [:]
+
+                      if check["faulted"] as? Bool == true {
+                          throw HordeError.server("The AI worker failed. Try again.")
+                      }
+                      if check["done"] as? Bool == true {
+                          finished = true
+                          break
+                      }
+
+                      let position = check["queue_position"] as? Int ?? 0
+                      let wait = check["wait_time"] as? Int ?? 0
+                      if wait > 0 {
+                          progress("In the free queue (spot \(position)), about \(wait)s left...")
+                      } else {
+                          progress("Working on it...")
+                      }
+                  }
+
+                  if !finished {
+                      _ = try? await URLSession.shared.data(
+                          for: makeRequest("/generate/status/\(jobID)", method: "DELETE")
+                      )
+                      throw HordeError.timedOut
+                  }
+
+                  let (statusData, statusResponse) = try await URLSession.shared.data(
+                      for: makeRequest("/generate/status/\(jobID)")
+                  )
+                  try Self.validate(statusData, statusResponse)
+
+                  guard let statusObject = try? JSONSerialization.jsonObject(with: statusData) as? [String: Any],
+                        let generations = statusObject["generations"] as? [[String: Any]],
+                        let first = generations.first,
+                        let img = first["img"] as? String else {
+                      throw HordeError.noResult
+                  }
+
+                  if first["censored"] as? Bool == true { throw HordeError.censored }
+
+                  let imageData: Data
+                  if img.hasPrefix("http"), let url = URL(string: img) {
+                      let (downloaded, _) = try await URLSession.shared.data(from: url)
+                      imageData = downloaded
+                  } else if let decoded = Data(base64Encoded: img) {
+                      imageData = decoded
+                  } else {
+                      throw HordeError.noResult
+                  }
+
+                  guard let output = UIImage(data: imageData) else { throw HordeError.noResult }
+
+                  // Give back the original aspect ratio (the AI needs multiples of 64).
+                  let outSize = CGSize(
+                      width: output.size.width,
+                      height: output.size.width * image.size.height / image.size.width
+                  )
+                  return Self.render(output, size: outSize)
+              }
+
+              private func makeRequest(_ path: String, method: String = "GET", body: Data? = nil) -> URLRequest {
+                  var request = URLRequest(url: URL(string: base + path)!)
+                  request.httpMethod = method
+                  request.timeoutInterval = 60
+                  request.setValue(apiKey, forHTTPHeaderField: "apikey")
+                  request.setValue("LoveYou:1.0:github", forHTTPHeaderField: "Client-Agent")
+                  if let body = body {
+                      request.httpBody = body
+                      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  }
+                  return request
+              }
+
+              private static func validate(_ data: Data, _ response: URLResponse) throws {
+                  guard let http = response as? HTTPURLResponse else { return }
+                  guard (200..<300).contains(http.statusCode) else {
+                      let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                      let message = object?["message"] as? String ?? "Server error (\(http.statusCode))."
+                      throw HordeError.server(message)
+                  }
+              }
+
+              private static func prepare(_ image: UIImage) -> (image: UIImage, width: Int, height: Int) {
+                  let longest = max(image.size.width, image.size.height)
+                  let scale = min(1, 576 / longest)
+                  func snap(_ value: CGFloat) -> Int {
+                      max(64, Int((value * scale / 64).rounded()) * 64)
+                  }
+                  let width = snap(image.size.width)
+                  let height = snap(image.size.height)
+                  let resized = render(image, size: CGSize(width: width, height: height))
+                  return (resized, width, height)
+              }
+
+              private static func render(_ image: UIImage, size: CGSize) -> UIImage {
+                  let format = UIGraphicsImageRendererFormat()
+                  format.scale = 1
+                  return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                      image.draw(in: CGRect(origin: .zero, size: size))
+                  }
+              }
+          }
+          EOF
+
+          cat > Sources/ContentView.swift <<'EOF'
+          import SwiftUI
+
+          struct ContentView: View {
+              @AppStorage("hordeKey") private var hordeKey = "0000000000"
+              @State private var original: UIImage?
+              @State private var result: UIImage?
+              @State private var showOriginal = false
+              @State private var prompt = "make it wonderful"
+              @State private var strength = 0.5
+              @State private var isWorking = false
+              @State private var status = ""
+              @State private var errorText: String?
+              @State private var showPicker = false
+              @State private var showShare = false
+              @State private var showSettings = false
+
+              private var displayed: UIImage? {
+                  showOriginal ? original : (result ?? original)
+              }
+
+              var body: some View {
+                  NavigationView {
+                      ScrollView {
+                          VStack(spacing: 16) {
+                              imageArea
+
+                              if result != nil {
+                                  Picker("", selection: $showOriginal) {
+                                      Text("Wonderful").tag(false)
+                                      Text("Original").tag(true)
+                                  }
+                                  .pickerStyle(.segmented)
+                              }
+
+                              HStack(spacing: 12) {
+                                  Button { showPicker = true } label: {
+                                      Label("Choose screenshot", systemImage: "photo")
+                                  }
+                                  .buttonStyle(.bordered)
+
+                                  Button { pasteImage() } label: {
+                                      Label("Paste", systemImage: "doc.on.clipboard")
+                                  }
+                                  .buttonStyle(.bordered)
+                              }
+
+                              TextField("What should it become?", text: $prompt)
+                                  .textFieldStyle(.roundedBorder)
+
+                              VStack(alignment: .leading, spacing: 4) {
+                                  Slider(value: $strength, in: 0.2...0.8)
+                                  HStack {
+                                      Text("A little").font(.caption).foregroundColor(.secondary)
+                                      Spacer()
+                                      Text("A lot").font(.caption).foregroundColor(.secondary)
+                                  }
+                              }
+
+                              Button(action: run) {
+                                  HStack(spacing: 8) {
+                                      if isWorking { ProgressView().tint(.white) }
+                                      Text(isWorking ? "Working..." : "Make it wonderful ✨")
+                                  }
+                                  .frame(maxWidth: .infinity)
+                              }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.pink)
+                              .controlSize(.large)
+                              .disabled(original == nil || isWorking)
+
+                              if isWorking {
+                                  Text(status)
+                                      .font(.footnote)
+                                      .foregroundColor(.secondary)
+                                      .multilineTextAlignment(.center)
+                              }
+
+                              if let errorText = errorText {
+                                  Text(errorText)
+                                      .font(.footnote)
+                                      .foregroundColor(.red)
+                                      .multilineTextAlignment(.center)
+                              }
+
+                              if result != nil {
+                                  Button { showShare = true } label: {
+                                      Label("Save or share", systemImage: "square.and.arrow.up")
+                                  }
+                                  .buttonStyle(.bordered)
+                              }
+                          }
+                          .padding()
+                      }
+                      .navigationTitle("Love You 💗")
+                      .toolbar {
+                          ToolbarItem(placement: .navigationBarTrailing) {
+                              Button { showSettings = true } label: {
+                                  Image(systemName: "gearshape")
+                              }
+                          }
+                      }
+                  }
+                  .navigationViewStyle(.stack)
+                  .sheet(isPresented: $showPicker) {
+                      PhotoPicker { image in setOriginal(image) }
+                  }
+                  .sheet(isPresented: $showShare) {
+                      if let result = result {
+                          ShareSheet(items: [result])
+                      }
+                  }
+                  .sheet(isPresented: $showSettings) {
+                      SettingsView(key: $hordeKey)
+                  }
+              }
+
+              @ViewBuilder
+              private var imageArea: some View {
+                  if let image = displayed {
+                      Image(uiImage: image)
+                          .resizable()
+                          .scaledToFit()
+                          .cornerRadius(18)
+                          .shadow(radius: 6)
+                          .frame(maxHeight: 420)
+                  } else {
+                      RoundedRectangle(cornerRadius: 18)
+                          .fill(Color.pink.opacity(0.12))
+                          .frame(height: 260)
+                          .overlay(
+                              VStack(spacing: 8) {
+                                  Text("🖼️").font(.system(size: 44))
+                                  Text("Pick a screenshot of anything")
+                                      .foregroundColor(.secondary)
+                              }
+                          )
+                  }
+              }
+
+              private func setOriginal(_ image: UIImage) {
+                  original = image
+                  result = nil
+                  showOriginal = false
+                  errorText = nil
+              }
+
+              private func pasteImage() {
+                  if let image = UIPasteboard.general.image {
+                      setOriginal(image)
+                  } else {
+                      errorText = "There's no image on your clipboard."
+                  }
+              }
+
+              private func run() {
+                  guard let source = original else { return }
+                  errorText = nil
+                  isWorking = true
+                  status = "Sending to the AI..."
+
+                  let trimmedKey = hordeKey.trimmingCharacters(in: .whitespaces)
+                  let client = HordeClient(apiKey: trimmedKey.isEmpty ? "0000000000" : trimmedKey)
+                  let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let strengthValue = strength
+
+                  Task {
+                      do {
+                          let output = try await client.generate(
+                              image: source,
+                              prompt: HordeClient.lovelyPrompt(from: text),
+                              strength: strengthValue
+                          ) { message in
+                              Task { @MainActor in status = message }
+                          }
+                          await MainActor.run {
+                              result = output
+                              showOriginal = false
+                              isWorking = false
+                          }
+                      } catch {
+                          await MainActor.run {
+                              errorText = error.localizedDescription
+                              isWorking = false
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct SettingsView: View {
+              @Binding var key: String
+              @Environment(\.presentationMode) private var presentationMode
+
+              var body: some View {
+                  NavigationView {
+                      Form {
+                          Section(
+                              header: Text("AI Horde key"),
+                              footer: Text("Leave it as 0000000000 to use the free anonymous queue. A free key from aihorde.net/register gets you through the queue faster. It is stored only on this device.")
+                          ) {
+                              TextField("API key", text: $key)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                          }
+                      }
+                      .navigationTitle("Settings")
+                      .toolbar {
+                          ToolbarItem(placement: .navigationBarTrailing) {
+                              Button("Done") { presentationMode.wrappedValue.dismiss() }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Generate Xcode project
+        shell: bash
+        run: |
+          brew install xcodegen
+          cat > project.yml <<EOF
+          name: ${APP_NAME}
+          options:
+            bundleIdPrefix: com.example
+          targets:
+            ${APP_NAME}:
+              type: application
+              platform: iOS
+              deploymentTarget: "15.0"
+              sources: [Sources]
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: ${BUNDLE_ID}
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_CFBundleDisplayName: "${DISPLAY_NAME}"
+                  INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Save your wonderful pictures to Photos."
+                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+          EOF
+          xcodegen generate
+
+      - name: Build
+        shell: bash
+        run: |
+          xcodebuild \
+            -project "${APP_NAME}.xcodeproj" \
+            -scheme "${APP_NAME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/${APP_NAME}.app" Payload/
+          zip -qr "${APP_NAME}.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-ipa
+          path: ${{ env.APP_NAME }}.ipa
